@@ -1,0 +1,123 @@
+/// Obfuscates (or de-obfuscates) HumidiFi swap instruction data in place using a simple XOR-based stream cipher.
+///
+/// This function is symmetric: applying it twice restores the original data.
+/// It processes the data in 8-byte (64-bit) chunks.
+///
+/// The transformation for each 8-byte chunk `i` involves:
+/// 1. XOR with a static 64-bit key (`HUMIDIFI_IX_DATA_KEY`).
+/// 2. XOR with a position-dependent mask (`pos_mask`).
+///    - `pos_mask` starts at 0.
+///    - For each subsequent chunk, `pos_mask` is incremented by `0x0001_0001_0001_0001`.
+///      This creates a rolling pattern that changes for each 64-bit block.
+///
+/// Handling of remainders (data length not a multiple of 8):
+/// - Any remaining bytes at the end are copied into a temporary 64-bit buffer (zero-padded).
+/// - The same XOR operations (key + current pos_mask) are applied to this buffer.
+/// - The valid bytes are copied back to the original slice.
+///
+/// Note: This is not a cryptographically secure cipher but rather a lightweight obfuscation
+/// to hide the instruction structure on-chain or in transit.
+/// 
+pub const HUMIDIFI_SWAP_SELECTOR: u8 = 0x4;
+const HUMIDIFI_IX_DATA_KEY_SEED: [u8; 32] = [
+    58, 255, 47, 255, 226, 186, 235, 195, 123, 131, 245, 8, 11, 233, 132, 219, 225, 40, 79, 119,
+    169, 121, 169, 58, 197, 1, 122, 9, 216, 164, 149, 97,
+];
+pub const HUMIDIFI_IX_DATA_KEY: u64 = u64::from_le_bytes([
+    HUMIDIFI_IX_DATA_KEY_SEED[0],
+    HUMIDIFI_IX_DATA_KEY_SEED[1],
+    HUMIDIFI_IX_DATA_KEY_SEED[2],
+    HUMIDIFI_IX_DATA_KEY_SEED[3],
+    HUMIDIFI_IX_DATA_KEY_SEED[4],
+    HUMIDIFI_IX_DATA_KEY_SEED[5],
+    HUMIDIFI_IX_DATA_KEY_SEED[6],
+    HUMIDIFI_IX_DATA_KEY_SEED[7],
+]);
+
+fn main() {
+    // 0bc7a29d90470eb94aabc533e3baeac338ff2dffe0bae9c33d
+    let data = vec![
+        0x0b, 0xc7, 0xa2, 0x9d, 0x90, 0x47, 0x0e, 0xb9,
+        0x4a, 0xab, 0xc5, 0x33, 0xe3, 0xba, 0xea, 0xc3,
+        0x38, 0xff, 0x2d, 0xff, 0xe0, 0xba, 0xe9, 0xc3,
+        0x3d
+    ];
+
+    let params = deobfsucate_humidifi_swap_ix(data);
+
+    println!("Swap ID: {}", params.swap_id);
+    println!("Amount In: {}", params.amount_in);
+    println!("Is Base to Quote: {}", params.is_base_to_quote);
+
+    println!("--------------------------------------------------");
+
+    // 236176715d8fa196ed9c61feebbaeac338ff2dffe0bae9c33d
+    let data2 = vec![
+        0x23, 0x61, 0x76, 0x71, 0x5d, 0x8f, 0xa1, 0x96,
+        0xed, 0x9c, 0x61, 0xfe, 0xeb, 0xba, 0xea, 0xc3,
+        0x38, 0xff, 0x2d, 0xff, 0xe0, 0xba, 0xe9, 0xc3,
+        0x3d
+    ];
+
+    let params2 = deobfsucate_humidifi_swap_ix(data2);
+
+    println!("Swap ID: {}", params2.swap_id);
+    println!("Amount In: {}", params2.amount_in);
+    println!("Is Base to Quote: {}", params2.is_base_to_quote);
+}
+
+pub fn deobfsucate_humidifi_swap_ix(mut data: Vec<u8>) -> SwapParams {
+    println!("Obfuscated bytes: {:02x?}", data);
+
+    // Deobfuscate
+    obfuscate_instruction_data(&mut data);
+
+    println!("Deobfuscated bytes: {:02x?}", data);
+
+    // Check selector
+    let selector = data.pop().unwrap();
+    assert_eq!(selector, HUMIDIFI_SWAP_SELECTOR, "Selector mismatch");
+
+    // Deserialize SwapParams
+    let params: &SwapParams = bytemuck::from_bytes(&data);
+    *params
+}
+
+pub fn obfuscate_instruction_data(data: &mut [u8]) {
+    let mut qwords = data.chunks_exact_mut(8);
+    let mut pos_mask = 0_u64;
+    while let Some(qword) = qwords
+        .next()
+        .map(|q| unsafe { &mut *q.as_mut_ptr().cast::<u64>() })
+    {
+        *qword ^= HUMIDIFI_IX_DATA_KEY;
+        *qword ^= pos_mask;
+        pos_mask = pos_mask.wrapping_add(0x0001_0001_0001_0001);
+    }
+    let remainder = qwords.into_remainder();
+    let mut rem = 0_u64;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            remainder.as_ptr(),
+            &mut rem as *mut u64 as *mut u8,
+            remainder.len(),
+        );
+    }
+    rem ^= HUMIDIFI_IX_DATA_KEY;
+    rem ^= pos_mask;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            &rem as *const u64 as *const u8,
+            remainder.as_mut_ptr(),
+            remainder.len(),
+        )
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SwapParams {
+    pub swap_id: u64,
+    pub amount_in: u64,
+    pub is_base_to_quote: u8,
+    pub padding: [u8; 7],
+}
